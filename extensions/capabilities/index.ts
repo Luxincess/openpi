@@ -1,6 +1,7 @@
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
+import { onSetupApply } from "../shared/setup-apply.ts";
 import {
   capabilitiesRequestedByPrompt,
   requestsCapabilityGateway,
@@ -12,7 +13,6 @@ import {
 import {
   loadSetupConfig,
   type MyPiSetupConfig,
-  SETUP_CONFIG_CHANGED_CHANNEL,
 } from "../shared/setup-config.ts";
 import {
   getLoadedOpenPiCapabilities,
@@ -25,12 +25,9 @@ import {
   resetOpenPiToolSurface,
 } from "../shared/tool-surface.ts";
 import {
-  CAPABILITY_SHIMMER_INTERVAL_MS,
   CapabilityIntentHighlightEditor,
-  capabilityShimmerPhase,
   colorCapabilityKeyword,
   isLightNamedTheme,
-  supportsDynamicCapabilityShimmer,
 } from "./src/ui.ts";
 
 const CapabilitySchema = Type.Unsafe<OpenPiCapability>({
@@ -73,14 +70,13 @@ function capabilitySkillPaths(capabilities: readonly OpenPiCapability[]) {
 function skillGuidance(capabilities: readonly OpenPiCapability[]) {
   const skills = capabilitySkillPaths(capabilities);
   return skills.length > 0
-    ? `Before first use, read the matching OpenPI capability guidance: ${skills.join(", ")}.`
+    ? `Capability discovery only; loading tools does not request execution. Decide whether to use them from the user's full request. Before first use, read the matching OpenPI capability guidance: ${skills.join(", ")}.`
     : "";
 }
 
 interface CapabilityExtensionDependencies {
   readonly loadConfig: () => Pick<MyPiSetupConfig, "capabilities">;
   readonly sourcePath?: string;
-  readonly supportsDynamicShimmer?: () => boolean;
 }
 
 export function createCapabilitiesExtension(
@@ -89,28 +85,27 @@ export function createCapabilitiesExtension(
   },
 ) {
   return function capabilities(pi: ExtensionAPI) {
-    let shimmerEditor: CapabilityIntentHighlightEditor | undefined;
+    let shimmerPhase = 0;
     let shimmerTimer: ReturnType<typeof setInterval> | undefined;
-    let requestShimmerRender: (() => void) | undefined;
+    let shimmerActive = false;
 
     const stopShimmer = () => {
-      if (shimmerTimer) clearInterval(shimmerTimer);
+      if (shimmerTimer !== undefined) clearInterval(shimmerTimer);
       shimmerTimer = undefined;
-      shimmerEditor = undefined;
-      requestShimmerRender = undefined;
+      shimmerActive = false;
     };
 
-    const startShimmer = (
-      editor: CapabilityIntentHighlightEditor,
-      requestRender: () => void,
-      enabled: boolean,
-    ) => {
-      if (!enabled) return;
-      shimmerEditor = editor;
-      requestShimmerRender = requestRender;
+    const setShimmerActive = (active: boolean, requestRender: () => void) => {
+      shimmerActive = active;
+      if (!active) {
+        stopShimmer();
+        return;
+      }
       shimmerTimer ??= setInterval(() => {
-        if (shimmerEditor?.hasCapabilityIntent()) requestShimmerRender?.();
-      }, CAPABILITY_SHIMMER_INTERVAL_MS);
+        if (!shimmerActive) return;
+        shimmerPhase = (shimmerPhase + 0.08) % 1;
+        requestRender();
+      }, 120);
     };
 
     const reconcileDiscoveryGateway = () => {
@@ -123,13 +118,11 @@ export function createCapabilitiesExtension(
       });
     };
 
-    pi.events.on(SETUP_CONFIG_CHANGED_CHANNEL, reconcileDiscoveryGateway);
+    onSetupApply(pi, reconcileDiscoveryGateway);
 
     pi.on("session_start", (_event, ctx) => {
       stopShimmer();
-      const animateShimmer =
-        dependencies.supportsDynamicShimmer?.() ??
-        supportsDynamicCapabilityShimmer();
+      shimmerPhase = 0;
       resetOpenPiToolSurface(
         pi,
         dependencies.sourcePath
@@ -141,19 +134,20 @@ export function createCapabilitiesExtension(
         id: "capability-intent-highlight",
         order: 150,
         wrap: (base, tui, _theme, keybindings) => {
-          const editor = new CapabilityIntentHighlightEditor(
+          return new CapabilityIntentHighlightEditor(
             base,
             keybindings,
             (text) =>
-              colorCapabilityKeyword(text, {
-                colorMode: ctx.ui.theme.getColorMode(),
-                light: isLightNamedTheme(ctx.ui.theme.name),
-                animated: animateShimmer,
-                ...(animateShimmer ? { phase: capabilityShimmerPhase() } : {}),
-              }),
+              colorCapabilityKeyword(
+                text,
+                {
+                  colorMode: ctx.ui.theme.getColorMode(),
+                  light: isLightNamedTheme(ctx.ui.theme.name),
+                },
+                shimmerPhase,
+              ),
+            (active) => setShimmerActive(active, () => tui.requestRender()),
           );
-          startShimmer(editor, () => tui.requestRender(), animateShimmer);
-          return editor;
         },
       });
     });
@@ -164,6 +158,7 @@ export function createCapabilitiesExtension(
     });
 
     pi.on("before_agent_start", (event) => {
+      if (!("prompt" in event)) return;
       if (requestsCapabilityGateway(event.prompt)) {
         patchOwnedTools(pi, "capabilities", {
           enable: OPENPI_TOOL_SURFACE.capabilities.entry,
@@ -188,7 +183,7 @@ export function createCapabilitiesExtension(
       name: "openpi_load_tools",
       label: "Load OpenPI Tools",
       description:
-        "Load optional OpenPI groups only when useful: search, delegate, workflow, background, or session. Ordinary file and shell work needs none. Loaded groups stay available.",
+        "Load optional OpenPI groups only when useful: search, delegate, workflow, background, session, or runtime. Ordinary file and shell work needs none. Loaded groups stay available.",
       parameters: OpenPiLoadToolsParameters,
       async execute(_toolCallId, params: OpenPiLoadToolsInput) {
         const result = params.groups

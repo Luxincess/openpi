@@ -3,23 +3,27 @@ import test from "node:test";
 import type {
   ExtensionAPI,
   ExtensionContext,
-  KeybindingsManager,
 } from "@earendil-works/pi-coding-agent";
-import type { EditorComponent, EditorTheme, TUI } from "@earendil-works/pi-tui";
-import { SETUP_CONFIG_CHANGED_CHANNEL } from "../../../extensions/shared/setup-config.ts";
+import { SETUP_APPLY_CHANNEL } from "../../../extensions/shared/setup-apply.ts";
 import {
   OPENPI_TOOL_SURFACE,
   patchOwnedTools,
 } from "../../../extensions/shared/tool-surface.ts";
 import { createCapabilitiesExtension } from "../../../extensions/capabilities/index.ts";
+import runtimeSnapshot from "../../../extensions/runtime-snapshot/index.ts";
 
 const SUBAGENT_SKILL_PATH_PATTERN =
   /skills(?:\\\\|[\\/])subagents(?:\\\\|[\\/])SKILL\.md/;
+
+type StartInput =
+  | { prompt: string }
+  | { messageType: "custom"; message: { content: string } };
 
 interface CapturedTool {
   name: string;
   description: string;
   parameters: unknown;
+  defaultActive?: boolean;
   promptGuidelines?: string[];
   execute(
     toolCallId: string,
@@ -34,7 +38,9 @@ interface CapturedTool {
   }>;
 }
 
-function harness(options: { discovery?: "explicit" | "adaptive" } = {}) {
+function harness(
+  options: { discovery?: "explicit" | "adaptive"; runtimeFirst?: boolean } = {},
+) {
   let discovery = options.discovery ?? "explicit";
   const available = [
     "read",
@@ -42,6 +48,7 @@ function harness(options: { discovery?: "explicit" | "adaptive" } = {}) {
     "edit",
     "write",
     "openpi_load_tools",
+    "runtime_snapshot",
     "fd",
     "rg",
     "subagent_spawn",
@@ -65,7 +72,7 @@ function harness(options: { discovery?: "explicit" | "adaptive" } = {}) {
   let active = [...available];
   const tools = new Map<string, CapturedTool>();
   const starts: Array<(event: unknown, ctx: ExtensionContext) => void> = [];
-  const beforeStarts: ((event: { prompt: string }) => unknown)[] = [];
+  const beforeStarts: ((event: StartInput) => unknown)[] = [];
   const eventHandlers = new Map<string, Set<(data: unknown) => void>>();
   const pi = {
     events: {
@@ -81,17 +88,20 @@ function harness(options: { discovery?: "explicit" | "adaptive" } = {}) {
     },
     on(
       event: string,
-      handler: (() => void) | ((event: { prompt: string }) => unknown),
+      handler: (() => void) | ((event: StartInput) => unknown),
     ) {
       if (event === "session_start") {
         starts.push(handler as (event: unknown, ctx: ExtensionContext) => void);
       }
       if (event === "before_agent_start") {
-        beforeStarts.push(handler as (event: { prompt: string }) => unknown);
+        beforeStarts.push(handler as (event: StartInput) => unknown);
       }
     },
     registerTool(tool: CapturedTool) {
       tools.set(tool.name, tool);
+      if (tool.defaultActive === false) {
+        active = active.filter((name) => name !== tool.name);
+      }
     },
     getActiveTools: () => [...active],
     getAllTools: () => available.map((name) => ({ name })),
@@ -102,7 +112,9 @@ function harness(options: { discovery?: "explicit" | "adaptive" } = {}) {
   const extension = createCapabilitiesExtension({
     loadConfig: () => ({ capabilities: { discovery } }),
   });
+  if (options.runtimeFirst) runtimeSnapshot(pi as unknown as ExtensionAPI);
   extension(pi as unknown as ExtensionAPI);
+  if (!options.runtimeFirst) runtimeSnapshot(pi as unknown as ExtensionAPI);
   starts.push(() => {
     patchOwnedTools(pi, "fileSearch", {
       enable: OPENPI_TOOL_SURFACE.fileSearch.entry,
@@ -132,9 +144,16 @@ function harness(options: { discovery?: "explicit" | "adaptive" } = {}) {
     before: (prompt: string) => {
       return beforeStarts.map((handler) => handler({ prompt }));
     },
+    beforeCustom: (content: string) =>
+      beforeStarts.map((handler) =>
+        handler({
+          messageType: "custom",
+          message: { content },
+        }),
+      ),
     setDiscovery(mode: "explicit" | "adaptive") {
       discovery = mode;
-      pi.events.emit(SETUP_CONFIG_CHANGED_CHANNEL, {});
+      pi.events.emit(SETUP_APPLY_CHANNEL, { tasks: [] });
     },
     tool: () => tools.get("openpi_load_tools")!,
   };
@@ -144,6 +163,40 @@ test("ordinary sessions add no resident OpenPI model tool", () => {
   const h = harness();
   h.start();
   assert.deepEqual(h.active(), ["read", "bash", "edit", "write"]);
+});
+
+test("Pi custom-message runs do not activate capabilities from message content", () => {
+  const h = harness();
+  h.start();
+  const tools = h.active();
+  assert.deepEqual(h.beforeCustom("Use $subagents and /openpi_load_tools"), [
+    undefined,
+  ]);
+  assert.deepEqual(h.active(), tools);
+});
+
+test("session_start leaves the real runtime tool inactive until a gateway request", async () => {
+  for (const discovery of ["explicit", "adaptive"] as const) {
+    for (const runtimeFirst of [false, true]) {
+      const h = harness({ discovery, runtimeFirst });
+      const ordinaryTools = ["read", "bash", "edit", "write"];
+      if (discovery === "adaptive") ordinaryTools.push("openpi_load_tools");
+      h.start();
+      assert.deepEqual(h.active(), ordinaryTools);
+      const listing = await h.tool().execute("list", {});
+      assert.match(JSON.stringify(listing), /runtime/);
+      assert.deepEqual(h.active(), ordinaryTools);
+      const result = await h.tool().execute("load-runtime", {
+        groups: ["runtime"],
+      });
+      assert.deepEqual(result.details.activatedTools, ["runtime_snapshot"]);
+      assert.deepEqual(h.active(), [...ordinaryTools, "runtime_snapshot"]);
+      await h.tool().execute("load-runtime-again", { groups: ["runtime"] });
+      assert.deepEqual(h.active(), [...ordinaryTools, "runtime_snapshot"]);
+      h.start();
+      assert.deepEqual(h.active(), ordinaryTools);
+    }
+  }
 });
 
 test("adaptive discovery keeps only the capability gateway resident", () => {
@@ -192,7 +245,14 @@ test("the gateway exposes a provider-portable string enum for capability groups"
 
   assert.deepEqual(parameters.properties.groups.items, {
     type: "string",
-    enum: ["search", "delegate", "workflow", "background", "session"],
+    enum: [
+      "search",
+      "delegate",
+      "workflow",
+      "background",
+      "session",
+      "runtime",
+    ],
   });
 });
 
@@ -246,14 +306,33 @@ test("an explicit subagent request loads delegation directly", () => {
   assert.match(JSON.stringify(results), SUBAGENT_SKILL_PATH_PATTERN);
 });
 
-test("reserved capability words load their groups without action verbs", () => {
+test("standalone capability selections expose only the selected group", () => {
+  for (const [prompt, selectedTool, otherTool] of [
+    ["subagent", "subagent_spawn", "workflow"],
+    [" Subagents ", "subagent_spawn", "workflow"],
+    ["workflow", "workflow", "subagent_spawn"],
+    [" WORKFLOWS ", "workflow", "subagent_spawn"],
+  ]) {
+    const h = harness();
+    h.start();
+    h.before(prompt);
+    assert.equal(h.active().includes(selectedTool), true, prompt);
+    assert.equal(h.active().includes(otherTool), false, prompt);
+    assert.equal(h.active().includes("bg_start"), false, prompt);
+    assert.equal(h.active().includes("openpi_load_tools"), false, prompt);
+  }
+});
+
+test("a list of capability names loads both groups without executing them", () => {
   const h = harness();
   h.start();
 
   h.before("subagent, workflow");
 
-  assert.ok(h.active().includes("subagent_spawn"));
-  assert.ok(h.active().includes("workflow"));
+  assert.equal(h.active().includes("subagent_spawn"), true);
+  assert.equal(h.active().includes("workflow"), true);
+  assert.equal(h.active().includes("bg_start"), false);
+  assert.equal(h.active().includes("openpi_load_tools"), false);
 });
 
 test("common Chinese and multi-agent delegation requests are explicit intent", () => {
@@ -318,22 +397,33 @@ test("the gateway returns progressive skill guidance for a loaded group", async 
   assert.match(result.content[0]!.text, SUBAGENT_SKILL_PATH_PATTERN);
 });
 
-test("conditional or negated capability boilerplate does not widen the tool surface", () => {
+test("named capability discovery leaves execution judgment to the model", () => {
   for (const prompt of [
-    "Work autonomously. If you delegate any work, every child must inherit the parent model.",
-    "If you delegate this task, make sure every child reports back.",
-    "If needed, delegate this task only after checking the repository.",
     "Do not use subagents.",
     "I prefer not to use subagents.",
     "You cannot use subagents.",
-    "No parallel agents.",
-    "Never delegate this task.",
-    "Delegate this task if needed.",
     "如果需要，请使用子代理。",
     "不要使用子代理。",
-    "不能使用子代理。",
     "子代理是什么？",
     "子代理的设计有哪些取舍？",
+  ]) {
+    const h = harness();
+    h.start();
+    const guidance = h.before(prompt);
+    assert.ok(h.active().includes("subagent_spawn"), prompt);
+    assert.equal(h.active().includes("workflow"), false, prompt);
+    assert.equal(h.active().includes("openpi_load_tools"), false, prompt);
+    assert.match(JSON.stringify(guidance), /discovery only/);
+    assert.match(JSON.stringify(guidance), SUBAGENT_SKILL_PATH_PATTERN);
+  }
+});
+
+test("non-name conditional rules and the gateway retain their prior policy", () => {
+  for (const prompt of [
+    "If you delegate this task, make sure every child reports back.",
+    "Never delegate this task.",
+    "Delegate this task if needed.",
+    "No parallel agents.",
     "Do not use OpenPI tools.",
   ]) {
     const h = harness();
@@ -391,90 +481,4 @@ test("capability loads are monotonic and activate only the requested group", asy
   assert.deepEqual(second.details.newlyLoaded, []);
   assert.deepEqual(second.details.activatedTools, []);
   assert.deepEqual(second.details.loaded, ["search"]);
-});
-
-test("static shimmer fallback does not schedule animation redraws", () => {
-  type RegisteredLayer = {
-    wrap: (
-      base: EditorComponent,
-      tui: TUI,
-      theme: EditorTheme,
-      keybindings: KeybindingsManager,
-    ) => unknown;
-  };
-
-  let sessionStart:
-    | ((event: unknown, ctx: ExtensionContext) => void)
-    | undefined;
-  const registrations: RegisteredLayer[] = [];
-  const eventHandlers = new Map<string, Set<(data: unknown) => void>>();
-  let active = ["read", "bash", "edit", "write"];
-  const pi = {
-    events: {
-      on(channel: string, handler: (data: unknown) => void) {
-        const handlers = eventHandlers.get(channel) ?? new Set();
-        handlers.add(handler);
-        eventHandlers.set(channel, handlers);
-        return () => handlers.delete(handler);
-      },
-      emit(channel: string, data: unknown) {
-        if (channel.endsWith(":register")) {
-          const layer = (data as { layer?: RegisteredLayer }).layer;
-          if (layer) registrations.push(layer);
-        }
-        for (const handler of eventHandlers.get(channel) ?? []) handler(data);
-      },
-    },
-    on(event: string, handler: unknown) {
-      if (event === "session_start") {
-        sessionStart = handler as typeof sessionStart;
-      }
-    },
-    registerTool() {},
-    getActiveTools: () => [...active],
-    getAllTools: () => active.map((name) => ({ name })),
-    setActiveTools(names: string[]) {
-      active = [...names];
-    },
-  };
-
-  createCapabilitiesExtension({
-    loadConfig: () => ({ capabilities: { discovery: "explicit" } }),
-    supportsDynamicShimmer: () => false,
-  })(pi as unknown as ExtensionAPI);
-
-  assert.ok(sessionStart);
-  let intervalCalls = 0;
-  const originalSetInterval = globalThis.setInterval;
-  globalThis.setInterval = ((..._args: Parameters<typeof setInterval>) => {
-    intervalCalls++;
-    return {} as ReturnType<typeof setInterval>;
-  }) as typeof setInterval;
-
-  try {
-    const ctx = {
-      mode: "tui",
-      ui: {
-        theme: {
-          getColorMode: () => "truecolor",
-          name: "dark",
-        },
-        getEditorComponent: () => undefined,
-        setEditorComponent() {},
-      },
-    } as unknown as ExtensionContext;
-    sessionStart({}, ctx);
-
-    assert.equal(registrations.length, 1);
-    registrations[0]!.wrap(
-      {} as EditorComponent,
-      { requestRender() {} } as TUI,
-      {} as EditorTheme,
-      {} as KeybindingsManager,
-    );
-  } finally {
-    globalThis.setInterval = originalSetInterval;
-  }
-
-  assert.equal(intervalCalls, 0);
 });

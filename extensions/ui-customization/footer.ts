@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { relative } from "node:path";
+import { posix, win32 } from "node:path";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import {
   getCapabilities,
@@ -7,6 +7,7 @@ import {
   truncateToWidth,
   visibleWidth,
 } from "@earendil-works/pi-tui";
+import { formatCompactTokens } from "../shared/context-utilization.ts";
 import type {
   FooterItem,
   FooterLayoutItem,
@@ -111,16 +112,21 @@ function sanitizeTerminalLabel(text: string) {
     .replace(/[\u0000-\u001f\u007f-\u009f]/g, "");
 }
 
-export function formatTokens(tokens: number) {
-  if (tokens < 1_000) return `${tokens}`;
-  if (tokens < 1_000_000) return `${Math.round(tokens / 1_000)}k`;
-  return `${(tokens / 1_000_000).toFixed(1)}m`;
-}
-
-export function formatDirectory(cwd: string) {
-  const home = homedir();
-  if (cwd === home) return "~";
-  const display = cwd.startsWith(`${home}/`) ? `~/${relative(home, cwd)}` : cwd;
+export function formatDirectory(
+  cwd: string,
+  home = homedir(),
+  pathModule = process.platform === "win32" ? win32 : posix,
+) {
+  const relativePath = pathModule.relative(home, cwd);
+  const outsideHome =
+    relativePath === ".." ||
+    relativePath.startsWith(`..${pathModule.sep}`) ||
+    pathModule.isAbsolute(relativePath);
+  const display = outsideHome
+    ? cwd
+    : relativePath
+      ? `~/${relativePath.replaceAll(pathModule.sep, "/")}`
+      : "~";
   return sanitizeTerminalLabel(display);
 }
 
@@ -166,7 +172,9 @@ export function buildSegmentCatalog(
   ) => string = defaultPullRequest,
 ): Record<FooterItem, { text: string; tone: SegmentTone }> {
   const contextWindow =
-    modelInfo.contextWindow > 0 ? formatTokens(modelInfo.contextWindow) : "";
+    modelInfo.contextWindow > 0
+      ? formatCompactTokens(modelInfo.contextWindow)
+      : "";
   const contextText =
     modelInfo.contextPercent === null
       ? contextWindow
